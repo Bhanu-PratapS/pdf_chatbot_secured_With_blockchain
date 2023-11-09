@@ -1,19 +1,35 @@
 from hashlib import sha256
-#multiple blocks linked together will make a blockchain
+from time import time
+
 class Block:
-    #Each block will include its index, all transactions, and its previous hash
-    def __init__(self, index, transactions, prev_hash):
-        self.index = index  # index of each block
-        self.transactions = transactions # transactions (information about files stored in a block)
-        self.prev_hash = prev_hash # hash of the previous block. 
-        self.nonce = 0 # nonce useful for mining new block using POW consensus
+    def __init__(self, index, transactions, previous_hash):
+        self.index = index
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.timestamp = time()  # Assign the current time to each block
 
-
-    # creates a hash for the block
     def generate_hash(self):
-        #  generates hash code using the values stored in block instance. completely random  
-        all_data_combined = str(self.index) + str(self.nonce) + self.prev_hash + str(self.transactions)
-        return sha256(all_data_combined.encode()).hexdigest()
-    
-    def add_t(self, t):
-        self.transactions.append(t)
+        # Combine block data into a single string and generate its hash
+        block_contents = f"{self.index}{self.transactions}{self.previous_hash}{self.nonce}{self.timestamp}"
+        return sha256(block_contents.encode()).hexdigest()
+
+    def add_transaction(self, transaction):
+        if isinstance(self.transactions, list):
+            self.transactions.append(transaction)
+        else:
+            raise ValueError("Transactions must be a list")
+
+    def __repr__(self):
+        return f"Block(index={self.index}, transactions={self.transactions}, previous_hash='{self.previous_hash}', nonce={self.nonce}, timestamp={self.timestamp})"
+
+# Example usage
+if __name__ == "__main__":
+    # Create a block
+    block = Block(index=0, transactions=[], previous_hash="0")
+
+    # Add a transaction
+    block.add_transaction("userA sends 2 BTC to userB")
+
+    # View the block's data
+    print(block)

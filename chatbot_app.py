@@ -1,113 +1,176 @@
 import streamlit as st
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import HuggingFaceInstructEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-import jinja2  
+import os
+import base64
+import time
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import pipeline
+import torch
+from langchain.document_loaders import PDFMinerLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import SentenceTransformerEmbeddings
 from langchain.vectorstores import Chroma
-from constants import Settings
-persist_directory = "db"
+from langchain.llms import HuggingFacePipeline
+from langchain.chains import RetrievalQA
+from constants import CHROMA_SETTINGS
+from streamlit_chat import message
+from Blockchain import Blockchain
+from Block import Block
 
-def get_pdf_text(pdf_files):
-    text = ""
-    for pdf_file in pdf_files:
-        reader = PdfReader(pdf_file)
-        for page in reader.pages:
-            text += page.extract_text()
-    return text
+# Initialize the blockchain
+blockchain = Blockchain()
 
-def get_chunk_text(text):
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
+st.set_page_config(layout="wide")
+
+device = torch.device('cpu')
+
+checkpoint = "MBZUAI/LaMini-T5-738M"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+base_model = AutoModelForSeq2SeqLM.from_pretrained(
+    checkpoint,
+    torch_dtype=torch.float32
+)
+
+# Define the directory to save PDF files
+persist_directory = "docs"
+os.makedirs(persist_directory, exist_ok=True)
+
+@st.cache_resource
+def data_ingestion():
+    for root, dirs, files in os.walk("docs"):
+        for file in files:
+            if file.endswith(".pdf"):
+                print(file)
+                loader = PDFMinerLoader(os.path.join(root, file))
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=500)
+    texts = text_splitter.split_documents(documents)
+    #create embeddings here
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    #create vector store here
+    db = Chroma.from_documents(texts, embeddings, persist_directory=persist_directory, client_settings=CHROMA_SETTINGS)
+    db.persist()
+    db=None 
+
+
+def get_file_size(file):
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    return file_size
+
+def displayPDF(file_path):
+    with open(file_path, "rb") as f:
+        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
+    pdf_display = F'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+def summarize_pdf(pdf_file_path):
+    loader = PDFMinerLoader(pdf_file_path)
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+    texts = text_splitter.split_documents(documents)
+    final_texts = "".join(text.page_content for text in texts)
+
+    summarization_pipe = pipeline(
+        'summarization',
+        model=base_model,
+        tokenizer=tokenizer,
+        device=-1  # For CPU, use 0 for GPU
     )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    summary_text = summarization_pipe(final_texts, max_length=130, min_length=30, length_penalty=2.0, num_beams=4)[0]['summary_text']
+    return summary_text
 
-class Document:
-    def __init__(self, page_content, metadata=None):
-        self.page_content = page_content
-        self.metadata = metadata or {}
+def add_summary_to_blockchain(summary, filename):
+    transaction = {
+        "filename": filename,
+        "summary": summary,
+        "timestamp": time.time()
+    }
+    blockchain.add_new_transaction(transaction)
+    new_block = blockchain.mine()
+    return new_block
 
-persist_directory = "db"
-
-def get_vector_store(text_chunks):
-    client = Settings(chroma_db_impl="duckdb+parquet", persist_directory="db/", anonymized_telemetry=False)
-    embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
-    # Convert the text chunks to a list of Document objects.
-    documents = [Document(page_content=text_chunk, metadata={}) for text_chunk in text_chunks]
-    vector_store = Chroma.from_documents(documents, embeddings, persist_directory="db/", client_settings=client)
-    return vector_store
-
-
-
-def get_conversation_chain(vector_store):
-    from transformers import AutoModelForSeq2SeqLM
-    llm = AutoModelForSeq2SeqLM.from_pretrained("MBZUAI/LaMini-T5-738M")
-    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vector_store.as_retriever(),
-        memory=memory
+@st.cache_resource
+def llm_pipeline():
+    pipe = pipeline(
+        'text2text-generation',
+        model = base_model,
+        tokenizer = tokenizer,
+        max_length = 512,
+        do_sample = True,
+        temperature = 0.3,
+        top_p= 0.95,
+        device=device
     )
-    return conversation_chain
+    local_llm = HuggingFacePipeline(pipeline=pipe)
+    return local_llm
 
-def render_template(template_name, context):
-    """Renders a template using Jinja2."""
-    template_loader = jinja2.FileSystemLoader('templates')  # Make sure to place your template.html file in a 'templates' folder
-    template_env = jinja2.Environment(loader=template_loader)
-    template = template_env.get_template(template_name)
-    return template.render(context)
+@st.cache_resource
+def qa_llm():
+    llm = llm_pipeline()
+    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    db = Chroma(persist_directory="db", embedding_function = embeddings, client_settings=CHROMA_SETTINGS)
+    retriever = db.as_retriever()
+    qa = RetrievalQA.from_chain_type(
+        llm = llm,
+        chain_type = "stuff",
+        retriever = retriever,
+        return_source_documents=True
+    )
+    return qa
 
-def handle_user_input(question):
-    response = st.session_state.conversation({'question': question})
-    st.session_state.chat_history = response['chat_history']
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            message_type = "user-message"  # Define the message type for user messages
-        else:
-            message_type = "bot-message"  # Define the message type for bot messages
-        st.write(message.content, message_type)
+def process_answer(instruction):
+    # Assuming the function `qa_llm` is defined and correctly set up as provided in the original code.
+    qa = qa_llm()
+    generated_text = qa(instruction)
+    answer = generated_text['result']
+    return answer
+
+def display_conversation(history):
+    for i in range(len(history["generated"])):
+        message(history["past"][i], is_user=True, key=str(i) + "_user")
+        message(history["generated"][i], key=str(i))
 
 def main():
-    load_dotenv()
-    st.set_page_config(page_title='Chat with Your own PDFs', page_icon=':books:')
+    st.markdown("<h1 style='text-align: center; color: blue;'>Chat with your PDF 🦜📄 </h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center; color: grey;'>Built By Bhanu </h3>", unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align: center; color:red;'>Upload your PDF 👇</h2>", unsafe_allow_html=True)
 
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
+    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
+    if uploaded_file is not None:
+        file_details = {"Filename": uploaded_file.name, "File size": get_file_size(uploaded_file)}
+        st.json(file_details)
 
-    st.header('Chat with Your own PDFs :books:')
-    question = st.text_input("Ask anything to your PDF: ")
+        file_path = os.path.join(persist_directory, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
+        displayPDF(file_path)
 
-    if question:
-        handle_user_input(question)
+        summary = summarize_pdf(file_path)
+        st.write(summary)
+        new_block = add_summary_to_blockchain(summary, uploaded_file.name)
+        if new_block:
+            st.success(f"A new block has been added to the blockchain: {new_block}")
+        else:
+            st.error("Failed to mine a new block.")
 
-    with st.sidebar:
-        st.subheader("Upload your Documents Here: ")
-        pdf_files = st.file_uploader("Choose your PDF Files and Press OK", type=['pdf'], accept_multiple_files=True)
+    st.markdown("<h4 style='color:black;'>Chat Here</h4>", unsafe_allow_html=True)
+    user_input = st.text_input("Enter your question here:", key="input")
+    send_button = st.button(label="Send", key="send_button")
+    
+    if "generated" not in st.session_state:
+        st.session_state["generated"] = ["I am ready to help you"]
+    if "past" not in st.session_state:
+        st.session_state["past"] = ["Hey there!"]
 
-        if st.button("OK"):
-            with st.spinner("Processing your PDFs..."):
-                # Get PDF Text
-                raw_text = get_pdf_text(pdf_files)
+    if send_button and user_input:
+        answer = process_answer(user_input)
+        st.session_state["past"].append(user_input)
+        response = answer
+        st.session_state["generated"].append(response)
 
-                # Get Text Chunks
-                text_chunks = get_chunk_text(raw_text)
-
-                # Create Vector Store
-                vector_store = get_vector_store(text_chunks)
-                st.write("DONE")
-
-                # Create conversation chain
-                st.session_state.conversation = get_conversation_chain(vector_store)
+    display_conversation(st.session_state)
 
 if __name__ == "__main__":
     main()
